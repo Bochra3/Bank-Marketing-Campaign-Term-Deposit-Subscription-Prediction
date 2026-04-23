@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Model artifacts
+models/
+*.joblib
+*.pkl
+
+# Streamlit cache/config
+.streamlit/secrets.toml
+
+# Notebook/runtime noise
+.ipynb_checkpoints/
