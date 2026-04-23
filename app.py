@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-import xgboost as xgb
 from imblearn.over_sampling import SMOTE
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler, OrdinalEncoder
 
@@ -80,7 +80,7 @@ def prepare_top5(df: pd.DataFrame, random_state: int) -> dict:
     x_all_scaled = scaler_all.fit_transform(x_all)
     x_res, y_res = SMOTE(random_state=random_state).fit_resample(x_all_scaled, y)
 
-    rank_model = xgb.XGBClassifier(random_state=random_state, eval_metric="logloss", verbosity=0)
+    rank_model = RandomForestClassifier(random_state=random_state, n_estimators=300)
     rank_model.fit(x_res, y_res)
 
     importance = pd.DataFrame(
@@ -105,13 +105,11 @@ def prepare_top5(df: pd.DataFrame, random_state: int) -> dict:
 
 
 def build_model(model_name: str, random_state: int, params: dict):
-    return xgb.XGBClassifier(
+    return RandomForestClassifier(
         random_state=random_state,
-        eval_metric="logloss",
-        verbosity=0,
-        n_estimators=params["xgb_n_estimators"],
-        max_depth=params["xgb_max_depth"],
-        learning_rate=params["xgb_learning_rate"],
+        n_estimators=params["rf_n_estimators"],
+        max_depth=params["rf_max_depth"],
+        min_samples_split=params["rf_min_samples_split"],
     )
 
 
@@ -206,20 +204,20 @@ if not csv_path.exists():
 with st.sidebar:
     st.header("Controls")
     sample_frac = st.slider("Train/Test sample fraction", min_value=0.10, max_value=1.00, value=1.00, step=0.05)
-    test_size = st.slider("Test size", min_value=0.10, max_value=0.40, value=0.10, step=0.05)
+    test_size = st.slider("Test size", min_value=0.10, max_value=0.40, value=0.20, step=0.05)
     threshold = st.slider("Decision threshold", min_value=0.10, max_value=0.90, value=0.50, step=0.05)
     random_state = st.number_input("Random state", min_value=1, max_value=9999, value=DEFAULT_SEED, step=1)
 
     st.markdown("---")
-    st.caption("XGBoost")
-    xgb_n_estimators = st.slider("n_estimators", 50, 400, 150, 10)
-    xgb_max_depth = st.slider("max_depth", 2, 10, 5, 1)
-    xgb_learning_rate = st.slider("learning_rate", 0.01, 0.30, 0.10, 0.01)
+    st.caption("Random Forest (Best for 80/20 split)")
+    rf_n_estimators = st.slider("n_estimators", 100, 600, 300, 20)
+    rf_max_depth = st.slider("max_depth", 2, 20, 10, 1)
+    rf_min_samples_split = st.slider("min_samples_split", 2, 20, 2, 1)
 
 params = {
-    "xgb_n_estimators": xgb_n_estimators,
-    "xgb_max_depth": xgb_max_depth,
-    "xgb_learning_rate": xgb_learning_rate,
+    "rf_n_estimators": rf_n_estimators,
+    "rf_max_depth": rf_max_depth,
+    "rf_min_samples_split": rf_min_samples_split,
 }
 
 try:
@@ -229,7 +227,7 @@ try:
         prep["x_all"],
         prep["y"],
         prep["top5"],
-        "XGBoost",
+        "RandomForest",
         float(test_size),
         float(sample_frac),
         int(random_state),
