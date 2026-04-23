@@ -3,13 +3,15 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from imblearn.over_sampling import SMOTE
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder, MinMaxScaler, OrdinalEncoder
+from sklearn.preprocessing import MinMaxScaler, OrdinalEncoder
+from xgboost import XGBClassifier
 
 DEFAULT_SEED = 42
+TOP_INPUT_FEATURES = ["contact", "housing", "duration", "poutcome", "previous"]
 
-st.set_page_config(page_title="Bank Marketing Predictor", page_icon=":sparkles:", layout="centered")
+st.set_page_config(page_title="Term Deposit Prediction", page_icon=":sparkles:", layout="wide")
 
 st.markdown(
     """
@@ -24,12 +26,6 @@ st.markdown(
         color: white;
         box-shadow: 0 10px 25px rgba(15, 23, 42, 0.18);
         margin-bottom: 1rem;
-    }
-    div[data-testid="stMetric"] {
-        border: 1px solid #d0d5dd;
-        border-radius: 12px;
-        background: white;
-        padding: 0.45rem 0.2rem;
     }
     </style>
     """,
@@ -46,151 +42,126 @@ def normalize_dataset(df: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
-def get_feature_lists(df: pd.DataFrame) -> tuple[list[str], list[str]]:
+def split_features(df: pd.DataFrame) -> tuple[list[str], list[str]]:
     num_cols = df.select_dtypes(exclude="object").columns.tolist()
     cat_cols = df.select_dtypes(include="object").columns.tolist()
-
     if "term_deposit" in cat_cols:
         cat_cols.remove("term_deposit")
-    if "pdays" in num_cols:
-        num_cols.remove("pdays")
-
     return num_cols, cat_cols
 
 
 @st.cache_data(show_spinner=False)
 def read_data(path: str) -> pd.DataFrame:
-    return pd.read_csv(path)
+    return normalize_dataset(pd.read_csv(path))
 
 
 @st.cache_resource(show_spinner=True)
-def prepare_top5(df: pd.DataFrame, random_state: int) -> dict:
-    data = normalize_dataset(df)
-    num_cols, cat_cols = get_feature_lists(data)
-
-    y_encoder = LabelEncoder()
-    y = y_encoder.fit_transform(data["term_deposit"].astype(str))
-
-    cat_encoder = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
-    x_cat = pd.DataFrame(cat_encoder.fit_transform(data[cat_cols]), columns=cat_cols, index=data.index)
-    x_num = data[num_cols].copy()
-    x_all = pd.concat([x_num, x_cat], axis=1)
-
-    scaler_all = MinMaxScaler()
-    x_all_scaled = scaler_all.fit_transform(x_all)
-    x_res, y_res = SMOTE(random_state=random_state).fit_resample(x_all_scaled, y)
-
-    rank_model = RandomForestClassifier(random_state=random_state, n_estimators=300)
-    rank_model.fit(x_res, y_res)
-
-    importance = pd.DataFrame(
-        {
-            "feature": x_all.columns,
-            "importance": rank_model.feature_importances_,
-        }
-    ).sort_values("importance", ascending=False)
-
-    top5_features = importance.head(5)["feature"].tolist()
-
-    return {
-        "data": data,
-        "num_cols": num_cols,
-        "cat_cols": cat_cols,
-        "cat_encoder": cat_encoder,
-        "x_all": x_all,
-        "y": y,
-        "importance": importance,
-        "top5": top5_features,
-    }
-
-
-def build_model(model_name: str, random_state: int, params: dict):
-    return RandomForestClassifier(
-        random_state=random_state,
-        n_estimators=params["rf_n_estimators"],
-        max_depth=params["rf_max_depth"],
-        min_samples_split=params["rf_min_samples_split"],
-    )
-
-
-@st.cache_resource(show_spinner=True)
-def train_top5_model(
-    x_all: pd.DataFrame,
-    y,
-    top5: list[str],
-    model_name: str,
-    test_size: float,
-    sample_frac: float,
+def train_xgboost_model(
+    df: pd.DataFrame,
     random_state: int,
-    params: dict,
+    test_size: float,
+    xgb_n_estimators: int,
+    xgb_max_depth: int,
+    xgb_learning_rate: float,
+    xgb_min_child_weight: int,
+    xgb_subsample: float,
+    xgb_colsample_bytree: float,
 ) -> dict:
-    if sample_frac < 1.0:
-        x_sample, _, y_sample, _ = train_test_split(
-            x_all,
-            y,
-            train_size=sample_frac,
-            stratify=y,
-            random_state=random_state,
-        )
-    else:
-        x_sample, y_sample = x_all, y
+    num_cols, cat_cols = split_features(df)
+    y = (df["term_deposit"].astype(str).str.lower() == "yes").astype(int).values
 
-    x_top5 = x_sample[top5].copy()
+    oe = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+    x_cat = pd.DataFrame(oe.fit_transform(df[cat_cols]), columns=cat_cols)
+    x_raw = pd.concat([df[num_cols].reset_index(drop=True), x_cat.reset_index(drop=True)], axis=1)
 
     x_train, x_test, y_train, y_test = train_test_split(
-        x_top5,
-        y_sample,
+        x_raw,
+        y,
         test_size=test_size,
-        stratify=y_sample,
+        stratify=y,
         random_state=random_state,
     )
 
     scaler = MinMaxScaler()
     x_train_scaled = scaler.fit_transform(x_train)
-
+    x_test_scaled = scaler.transform(x_test)
     x_res, y_res = SMOTE(random_state=random_state).fit_resample(x_train_scaled, y_train)
 
-    model = build_model(model_name, random_state, params)
+    model = XGBClassifier(
+        random_state=random_state,
+        eval_metric="logloss",
+        n_estimators=xgb_n_estimators,
+        max_depth=xgb_max_depth,
+        learning_rate=xgb_learning_rate,
+        min_child_weight=xgb_min_child_weight,
+        subsample=xgb_subsample,
+        colsample_bytree=xgb_colsample_bytree,
+    )
     model.fit(x_res, y_res)
+
+    y_prob = model.predict_proba(x_test_scaled)[:, 1]
+    importance = (
+        pd.DataFrame({"Feature": x_raw.columns, "Importance": model.feature_importances_})
+        .sort_values("Importance", ascending=False)
+        .reset_index(drop=True)
+    )
 
     return {
         "model": model,
         "scaler": scaler,
-        "n_train": len(y_train),
-        "n_test": len(y_test),
-        "pos_rate": float(pd.Series(y_sample).mean()),
+        "encoder": oe,
+        "num_cols": num_cols,
+        "cat_cols": cat_cols,
+        "x_columns": list(x_raw.columns),
+        "y_test": y_test,
+        "y_prob": y_prob,
+        "importance": importance,
     }
 
 
-def encode_categorical_value(feature: str, value: str, cat_cols: list[str], cat_encoder: OrdinalEncoder) -> float:
-    idx = cat_cols.index(feature)
-    categories = [str(x) for x in cat_encoder.categories_[idx]]
-    try:
-        return float(categories.index(str(value)))
-    except ValueError:
-        return -1.0
+def build_model_input(
+    df: pd.DataFrame,
+    user_numeric: dict[str, float],
+    user_categorical: dict[str, str],
+    trained: dict,
+) -> pd.DataFrame:
+    num_cols: list[str] = trained["num_cols"]
+    cat_cols: list[str] = trained["cat_cols"]
+    oe: OrdinalEncoder = trained["encoder"]
+
+    num_defaults = {col: float(df[col].median()) for col in num_cols}
+    cat_defaults = {
+        col: str(df[col].mode(dropna=True).iloc[0]) if not df[col].mode(dropna=True).empty else str(df[col].astype(str).iloc[0])
+        for col in cat_cols
+    }
+
+    num_defaults.update({k: float(v) for k, v in user_numeric.items()})
+    cat_defaults.update({k: str(v) for k, v in user_categorical.items()})
+
+    num_row = pd.DataFrame([num_defaults])
+    cat_row = pd.DataFrame([cat_defaults])
+    cat_encoded = pd.DataFrame(oe.transform(cat_row), columns=cat_cols)
+    x_input = pd.concat([num_row, cat_encoded], axis=1)[trained["x_columns"]]
+    return x_input
 
 
-def build_top5_input_df(user_values: dict, bundle: dict) -> pd.DataFrame:
-    row = {}
-    for feature in bundle["top5"]:
-        if feature in bundle["num_cols"]:
-            row[feature] = float(user_values[feature])
-        else:
-            row[feature] = encode_categorical_value(
-                feature,
-                str(user_values[feature]),
-                bundle["cat_cols"],
-                bundle["cat_encoder"],
-            )
-    return pd.DataFrame([row])[bundle["top5"]]
+def compute_metrics(y_true, y_prob, threshold: float) -> dict[str, float]:
+    y_pred = (y_prob >= threshold).astype(int)
+    return {
+        "Accuracy": float(accuracy_score(y_true, y_pred)),
+        "Recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "Precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "F1": float(f1_score(y_true, y_pred, zero_division=0)),
+    }
 
 
 st.markdown(
     """
     <div class="hero">
-        <h2 style="margin:0;">Bank Marketing Predictor</h2>
-        <p style="margin:0.25rem 0 0 0; opacity:0.9;">Beautiful, simple UI with only your 5 most important features.</p>
+        <h2 style="margin:0;">Term Deposit Prediction</h2>
+        <p style="margin:0.25rem 0 0 0; opacity:0.9;">
+            Predict whether a client will subscribe to a term deposit (Yes/No) after a marketing campaign.
+        </p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -201,90 +172,105 @@ if not csv_path.exists():
     st.error("Missing `bank.csv` beside `app.py`.")
     st.stop()
 
+df = read_data(str(csv_path))
+num_cols, cat_cols = split_features(df)
+
 with st.sidebar:
     st.header("Controls")
-    sample_frac = st.slider("Train/Test sample fraction", min_value=0.10, max_value=1.00, value=1.00, step=0.05)
-    test_size = st.slider("Test size", min_value=0.10, max_value=0.40, value=0.20, step=0.05)
+    test_size = st.slider("Train/Test sample fraction (test size)", min_value=0.10, max_value=0.40, value=0.10, step=0.05)
     threshold = st.slider("Decision threshold", min_value=0.10, max_value=0.90, value=0.50, step=0.05)
     random_state = st.number_input("Random state", min_value=1, max_value=9999, value=DEFAULT_SEED, step=1)
 
-    st.markdown("---")
-    st.caption("Random Forest (Best for 80/20 split)")
-    rf_n_estimators = st.slider("n_estimators", 100, 600, 300, 20)
-    rf_max_depth = st.slider("max_depth", 2, 20, 10, 1)
-    rf_min_samples_split = st.slider("min_samples_split", 2, 20, 2, 1)
-
-params = {
-    "rf_n_estimators": rf_n_estimators,
-    "rf_max_depth": rf_max_depth,
-    "rf_min_samples_split": rf_min_samples_split,
-}
+    st.subheader("XGBoost")
+    xgb_n_estimators = st.slider("xgb n_estimators", min_value=50, max_value=600, value=250, step=25)
+    xgb_max_depth = st.slider("xgb max_depth", min_value=2, max_value=12, value=5, step=1)
+    xgb_learning_rate = st.slider("xgb learning_rate", min_value=0.01, max_value=0.40, value=0.08, step=0.01)
+    xgb_min_child_weight = st.slider("xgb min_child_weight", min_value=1, max_value=15, value=1, step=1)
+    xgb_subsample = st.slider("xgb subsample", min_value=0.50, max_value=1.00, value=0.90, step=0.05)
+    xgb_colsample_bytree = st.slider("xgb colsample_bytree", min_value=0.50, max_value=1.00, value=0.90, step=0.05)
 
 try:
-    df = read_data(str(csv_path))
-    prep = prepare_top5(df, int(random_state))
-    trained = train_top5_model(
-        prep["x_all"],
-        prep["y"],
-        prep["top5"],
-        "RandomForest",
-        float(test_size),
-        float(sample_frac),
-        int(random_state),
-        params,
+    trained = train_xgboost_model(
+        df=df,
+        random_state=int(random_state),
+        test_size=float(test_size),
+        xgb_n_estimators=int(xgb_n_estimators),
+        xgb_max_depth=int(xgb_max_depth),
+        xgb_learning_rate=float(xgb_learning_rate),
+        xgb_min_child_weight=int(xgb_min_child_weight),
+        xgb_subsample=float(xgb_subsample),
+        xgb_colsample_bytree=float(xgb_colsample_bytree),
     )
 except Exception as exc:
-    st.error(f"Setup failed: {exc}")
+    st.error(f"Training failed: {exc}")
     st.stop()
 
-st.caption("Model uses only the 5 most important features discovered from your dataset.")
+metrics = compute_metrics(trained["y_test"], trained["y_prob"], float(threshold))
 
-with st.expander("Top 5 Features", expanded=True):
-    rank_df = prep["importance"].head(5).reset_index(drop=True)
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Accuracy", f"{metrics['Accuracy']:.3f}")
+col2.metric("Recall", f"{metrics['Recall']:.3f}")
+col3.metric("Precision", f"{metrics['Precision']:.3f}")
+col4.metric("F1", f"{metrics['F1']:.3f}")
+st.caption(f"Metrics are on test split at threshold = {threshold:.2f}")
+
+with st.expander("Top 5 Most Important Features - XGBoost", expanded=True):
+    rank_df = trained["importance"].head(5).copy()
     rank_df.index = rank_df.index + 1
-    st.dataframe(rank_df.rename(columns={"feature": "Feature", "importance": "Importance"}), use_container_width=True)
+    st.dataframe(rank_df, width="stretch")
 
 st.subheader("Client Inputs")
+st.caption("Input only: contact, housing, duration, previous outcome (poutcome), and previous.")
 
-user_values: dict[str, float | str] = {}
-cols = st.columns(2)
+numeric_inputs: dict[str, float] = {}
+categorical_inputs: dict[str, str] = {}
 
-for i, feature in enumerate(prep["top5"]):
-    with cols[i % 2]:
-        if feature in prep["num_cols"]:
-            series = prep["data"][feature]
-            min_val = float(series.min())
-            max_val = float(series.max())
-            med_val = float(series.median())
+with st.form("prediction_form"):
+    left, right = st.columns(2)
 
-            if feature == "duration":
-                user_values[feature] = st.slider(
-                    feature,
-                    min_value=int(min_val),
-                    max_value=int(max_val),
-                    value=int(med_val),
-                    step=10,
+    with left:
+        st.markdown("**Top Numeric Features**")
+        for col in ["duration", "previous"]:
+            if col in num_cols:
+                series = df[col]
+                min_val = float(series.min())
+                max_val = float(series.max())
+                med_val = float(series.median())
+                step = 10.0 if col == "duration" else 1.0
+                numeric_inputs[col] = float(
+                    st.number_input(
+                        col,
+                        min_value=min_val,
+                        max_value=max_val,
+                        value=med_val,
+                        step=step,
+                    )
                 )
-            else:
-                user_values[feature] = st.number_input(
-                    feature,
-                    value=med_val,
-                    min_value=min_val,
-                    max_value=max_val,
-                )
-        else:
-            options = sorted(prep["data"][feature].astype(str).dropna().unique().tolist())
-            user_values[feature] = st.selectbox(feature, options=options, index=0)
 
-if st.button("Predict", type="primary", use_container_width=True):
-    x_input = build_top5_input_df(user_values, prep)
+    with right:
+        st.markdown("**Top Categorical Features**")
+        for col in ["contact", "housing", "poutcome"]:
+            if col in cat_cols:
+                options = sorted(df[col].astype(str).dropna().unique().tolist())
+                mode_val = str(df[col].mode(dropna=True).iloc[0]) if not df[col].mode(dropna=True).empty else options[0]
+                default_idx = options.index(mode_val) if mode_val in options else 0
+                label = "previous outcome (poutcome)" if col == "poutcome" else col
+                categorical_inputs[col] = st.selectbox(label, options=options, index=default_idx)
+
+    missing_requested = [feature for feature in TOP_INPUT_FEATURES if feature not in num_cols + cat_cols]
+    if missing_requested:
+        st.warning(f"Some requested top features are missing from this dataset: {', '.join(missing_requested)}")
+
+    predict_clicked = st.form_submit_button("Predict", type="primary", use_container_width=True)
+
+if predict_clicked:
+    x_input = build_model_input(df=df, user_numeric=numeric_inputs, user_categorical=categorical_inputs, trained=trained)
     x_scaled = trained["scaler"].transform(x_input)
-
     prob_yes = float(trained["model"].predict_proba(x_scaled)[0, 1])
-    pred_yes = int(prob_yes >= threshold)
+    pred_yes = int(prob_yes >= float(threshold))
 
     st.metric("Subscription Probability (Yes)", f"{prob_yes * 100:.1f}%")
-    st.caption(f"Threshold: {threshold:.2f}")
+    st.caption(f"Decision threshold: {threshold:.2f}")
 
     if pred_yes == 1:
         st.success("Prediction: YES - likely to subscribe")
